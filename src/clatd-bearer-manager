@@ -1,0 +1,380 @@
+#!/usr/bin/env python3
+"""
+Manages per-interface clatd (464XLAT) instances for the cellular data
+bearer and, independently, the MMS bearer
+"""
+
+import argparse
+import fcntl
+import os
+import re
+import subprocess
+import sys
+import time
+
+import dbus
+
+LOCK_PATH = "/run/clatd-bearer-manager.lock"
+
+OFONO_BUS = "org.ofono"
+OFONO_MANAGER_IFACE = "org.ofono.Manager"
+OFONO_CM_IFACE = "org.ofono.ConnectionManager"
+
+SYSTEMD_BUS = "org.freedesktop.systemd1"
+SYSTEMD_PATH = "/org/freedesktop/systemd1"
+SYSTEMD_MANAGER_IFACE = "org.freedesktop.systemd1.Manager"
+SYSTEMD_UNIT_IFACE = "org.freedesktop.systemd1.Unit"
+
+# Running multiple clatd instances concurrently requires overriding several
+# defaults that would otherwise collide:
+#   - clat-dev: each instance needs its own TUN device name, since the
+#     default is "clat".
+#   - clat-v4-addr: each instance needs a unique IPv4 CLAT address, since
+#     the default is 192.0.0.1.
+#   - route-table: each instance needs a unique routing table. The default
+#     is 0xc1a7, and clatd internally installs an IPv6 rule into that table
+#     using a fixed priority, so sharing it causes a collision. This option
+#     expects a decimal value, not the hexadecimal form used in the
+#     documentation.
+MMS_CLAT_DEV = "clat-mms"
+MMS_CLAT_V4_ADDR = "192.0.0.2"
+MMS_ROUTE_TABLE = 49576
+
+CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
+IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
+
+def run_ip(*args):
+    subprocess.run(["ip", *args], capture_output=True)
+
+def ipv6_global_addr(iface):
+    result = subprocess.run(
+        ["ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global"],
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            return fields[3].split("/")[0]
+    return None
+
+def ipv4_global_addr(iface):
+    result = subprocess.run(
+        ["ip", "-4", "-o", "addr", "show", "dev", iface, "scope", "global"],
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            return fields[3].split("/")[0]
+    return None
+
+def wait_for_addr(iface, attempts=5, delay=1):
+    """
+    An interface reaching the "up" state does not guarantee its global
+    IPv6 address has been assigned yet, oFono can take a little longer to
+    configure it. Retry rather than starting clatd without a usable source
+    address, since clatd@.service has no Restart= and a failed start will
+    remain down until the next invocation.
+    """
+    for i in range(attempts):
+        addr = ipv6_global_addr(iface)
+        if addr:
+            return addr
+        if i + 1 < attempts:
+            time.sleep(delay)
+    return None
+
+class Systemd:
+    def __init__(self, bus):
+        self.bus = bus
+        self.manager = dbus.Interface(
+            bus.get_object(SYSTEMD_BUS, SYSTEMD_PATH), SYSTEMD_MANAGER_IFACE
+        )
+
+    def restart(self, unit):
+        self.manager.RestartUnit(unit, "replace")
+
+    def stop(self, unit):
+        try:
+            self.manager.StopUnit(unit, "replace")
+        except dbus.exceptions.DBusException:
+            pass
+
+    def is_active(self, unit):
+        try:
+            path = self.manager.GetUnit(unit)
+        except dbus.exceptions.DBusException:
+            return False
+        props = dbus.Interface(
+            self.bus.get_object(SYSTEMD_BUS, path), "org.freedesktop.DBus.Properties"
+        )
+        return str(props.Get(SYSTEMD_UNIT_IFACE, "ActiveState")) == "active"
+
+    def clatd_units(self):
+        """
+        All currently-loaded clatd@<iface>.service units, regardless of
+        state. used to find leftovers from a previous interface name
+        after a reconnect.
+        """
+        units = self.manager.ListUnitsByPatterns(
+            dbus.Array([], signature="s"), dbus.Array(["clatd@*"], signature="s")
+        )
+        return [str(u[0]) for u in units]
+
+def discover_context(bus, ctx_type, attempts=1, delay=1):
+    """
+    Find the first active oFono ConnectionManager context of the given
+    Type ("internet" or "mms"), returning its interface name and whatever
+    DNS64 resolvers it reports for itself
+
+    An interface's "up" dispatcher event fires as soon as the kernel netdev
+    comes up while oFono's own context bookkeeping can take a moment longer to
+    catch up, especially right after a reconnect. Retry rather than giving
+    up on the first empty result.
+    """
+    manager = dbus.Interface(bus.get_object(OFONO_BUS, "/"), OFONO_MANAGER_IFACE)
+    for i in range(attempts):
+        try:
+            modems = manager.GetModems()
+        except dbus.exceptions.DBusException:
+            modems = []
+        for modem_path, _props in modems:
+            cm = dbus.Interface(bus.get_object(OFONO_BUS, modem_path), OFONO_CM_IFACE)
+            try:
+                contexts = cm.GetContexts()
+            except dbus.exceptions.DBusException:
+                continue
+            for _ctx_path, ctx_props in contexts:
+                if str(ctx_props.get("Type")) != ctx_type or not ctx_props.get("Active"):
+                    continue
+                settings = ctx_props.get("Settings", {})
+                ipv6 = ctx_props.get("IPv6.Settings", {})
+                iface = settings.get("Interface") or ipv6.get("Interface")
+                dns64_servers = [str(d) for d in ipv6.get("DomainNameServers", [])]
+                if iface:
+                    return str(iface), dns64_servers
+        if i + 1 < attempts:
+            time.sleep(delay)
+    return None, []
+
+def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None):
+    lines = ["v4-conncheck-enable=0"]
+    if dns64_servers:
+        lines.append(f"dns64-servers={','.join(dns64_servers)}")
+    if not v4_defaultroute_enable:
+        lines.append("v4-defaultroute-enable=0")
+    if clat_dev:
+        lines.append(f"clat-dev={clat_dev}")
+    if clat_v4_addr:
+        lines.append(f"clat-v4-addr={clat_v4_addr}")
+    if clat_v6_addr:
+        lines.append(f"clat-v6-addr={clat_v6_addr}")
+    if route_table is not None:
+        lines.append(f"route-table={route_table}")
+
+    os.makedirs("/etc/clatd", exist_ok=True)
+    with open(f"/etc/clatd/{iface}.conf", "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+def add_dns64_routes(iface, src_addr, dns64_servers):
+    for dns in dns64_servers:
+        args = ["-6", "route", "replace", f"{dns}/128", "dev", iface]
+        if src_addr:
+            args += ["src", src_addr]
+        run_ip(*args)
+
+def ensure_mms_outbound_route(iface, src_addr):
+    """
+    clatd's `route-table` option (see its man page) only installs the
+    *return* path for PLAT-prefix traffic addressed back to the CLAT. It
+    provides no equivalent outbound route because, in the default
+    configuration (shared clat-v6-addr), the CLAT simply uses the host's
+    existing route to the PLAT.
+
+    The MMS instance uses its own clat-v6-addr to avoid address collisions
+    (see manage_mms's docstring), which means it also needs its own
+    outbound route. Since the MMS bearer never owns the system default
+    route (v4-defaultroute-enable=0), destination-based routing would
+    otherwise send packets through the cellular bearer instead. The
+    carrier drops those packets because their source address belongs to
+    the MMS bearer.
+
+    MMS_ROUTE_TABLE can be reused safely because it is dedicated to the MMS
+    bearer and is only used for traffic sourced from src_addr.
+
+    src_addr changes whenever the interface is recreated, so stale rules
+    from previous addresses must be removed. This only touches outbound
+    rules of the form "from <addr> lookup <table>"
+    """
+    run_ip("-6", "route", "replace", "default", "dev", iface, "table", str(MMS_ROUTE_TABLE))
+    outbound_rule_re = re.compile(r"^\d+:\s*from (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$")
+    existing = subprocess.run(
+        ["ip", "-6", "rule", "show"], capture_output=True, text=True
+    ).stdout
+    has_current = False
+    for line in existing.splitlines():
+        m = outbound_rule_re.match(line.strip())
+        if not m:
+            continue
+        if m.group(1) == src_addr:
+            has_current = True
+        else:
+            run_ip("-6", "rule", "del", "from", m.group(1), "lookup", str(MMS_ROUTE_TABLE))
+    if not has_current:
+        run_ip("-6", "rule", "add", "from", src_addr, "lookup", str(MMS_ROUTE_TABLE))
+
+def manage_mms(systemd, mms_iface, dns64_servers):
+    """
+    Give the MMS APN context its own clatd instance, separate from the
+    cellular one managed by manage_cellular().
+
+    v4-defaultroute-enable=0 (via write_clatd_conf) keeps the
+    cellular instance as the system's IPv4 default route. The MMS
+    instance only needs to reach the carrier's private (RFC1918) address
+    space, where the MMSC lives, rather than general internet traffic.
+
+    The MMS instance uses an explicit clat-v6-addr instead of the default
+    "shared" auto-selection. With multiple cellular interfaces active,
+    clatd's route-based address selection can choose the cellular
+    instance's address instead of the MMS one, causing the two instances
+    to collide. Using an explicit address also removes the need for the
+    self-selected-address watcher used by the cellular instance.
+
+    If the MMS bearer already has a native IPv4 address, no CLAT is
+    needed. Dual-stack and IPv4-only bearers can reach the MMSC directly,
+    so any existing MMS clatd instance is stopped instead.
+
+    This function does not install routes for the carrier's private
+    address space. routectld adds a host route for each MMSC destination
+    on demand before every send or receive, after first ensuring
+    the MMS CLAT instance is running.
+    """
+    unit = f"clatd@{mms_iface}.service"
+
+    if ipv4_global_addr(mms_iface):
+        if systemd.is_active(unit):
+            systemd.stop(unit)
+        return
+
+    if systemd.is_active(unit):
+        src_addr = ipv6_global_addr(mms_iface)
+        if src_addr:
+            ensure_mms_outbound_route(mms_iface, src_addr)
+        return
+
+    src_addr = wait_for_addr(mms_iface)
+    if not src_addr:
+        return
+
+    write_clatd_conf(
+        mms_iface,
+        dns64_servers,
+        v4_defaultroute_enable=False,
+        clat_dev=MMS_CLAT_DEV,
+        clat_v4_addr=MMS_CLAT_V4_ADDR,
+        clat_v6_addr=src_addr,
+        route_table=MMS_ROUTE_TABLE,
+    )
+    add_dns64_routes(mms_iface, src_addr, dns64_servers)
+    ensure_mms_outbound_route(mms_iface, src_addr)
+    systemd.restart(unit)
+
+def manage_cellular(iface, systemd, dns64_servers):
+    unit = f"clatd@{iface}.service"
+
+    write_clatd_conf(iface, dns64_servers)
+
+    src_addr = wait_for_addr(iface)
+    add_dns64_routes(iface, src_addr, dns64_servers)
+    systemd.restart(unit)
+
+    # Watch for up to 20s and correct clatd's self-selected address if
+    # needed. Keep watching for the full window because a closely-following
+    # invocation (e.g. a "down" then "up" pair from the same reconnect) can
+    # restart clatd again after we've already corrected it.
+    fixed_once = False
+    for _ in range(20):
+        time.sleep(1)
+        if not systemd.is_active(unit):
+            return
+
+        rule_output = subprocess.run(
+            ["ip", "-6", "rule", "show"], capture_output=True, text=True
+        ).stdout
+        match = next((line for line in rule_output.splitlines() if "fwmark 0xc1a7" in line), None)
+        if not match:
+            continue
+
+        m = IP6_RULE_RE.search(match)
+        if not m:
+            continue
+        prefix, picked_addr = m.group(1), m.group(2)
+
+        real_addr = ipv6_global_addr(iface)
+        if not real_addr:
+            continue
+
+        if picked_addr == real_addr:
+            # Correct. Only stop watching if we've never had to fix it,
+            # otherwise keep watching in case a restart is still in flight.
+            if not fixed_once:
+                break
+            time.sleep(2)
+            continue
+
+        run_ip("-6", "route", "replace", prefix, "dev", iface, "src", real_addr)
+        systemd.restart(unit)
+        fixed_once = True
+        time.sleep(2)
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mms-only",
+        action="store_true",
+        help="Only manage the MMS bearer's clatd instance",
+    )
+    return parser.parse_args()
+
+def main():
+    args = parse_args()
+
+    lock_file = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+
+    try:
+        bus = dbus.SystemBus()
+        systemd = Systemd(bus)
+
+        mms_iface, mms_dns64 = discover_context(bus, "mms")
+
+        if args.mms_only:
+            cellular_iface = None
+        else:
+            cellular_iface, cellular_dns64 = discover_context(bus, "internet", attempts=8, delay=1)
+
+        if not args.mms_only:
+            wanted = {iface for iface in (cellular_iface, mms_iface) if iface}
+            for unit in systemd.clatd_units():
+                m = CLATD_UNIT_RE.match(unit)
+                if m and m.group(1) not in wanted:
+                    systemd.stop(unit)
+
+        if mms_iface:
+            manage_mms(systemd, mms_iface, mms_dns64)
+
+        if args.mms_only:
+            return
+
+        if cellular_iface:
+            manage_cellular(cellular_iface, systemd, cellular_dns64)
+    except dbus.exceptions.DBusException as error:
+        print(f"clatd-bearer-manager: D-Bus error: {error}", file=sys.stderr)
+
+if __name__ == "__main__":
+    main()

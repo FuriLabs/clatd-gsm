@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# NetworkManager dispatcher script for clatd bearer management
+#
+# The cellular bearer's kernel interface name (ccmni0, ccmni1, ccmni2, ...) is not
+# fixed, it can change during reconnects and RAT changes. Rather than hardcoding one,
+# clatd-bearer-manager asks oFono which interface currently backs the connected bearer
+# each time it runs, and makes sure only that clatd@<iface>.service instance is running,
+# stopping any other clatd@<iface>.service left over from a previous PDP assigned interface.
+#
+# This script itself is intentionally tiny and does no slow/blocking work:
+# NetworkManager/nm-dispatcher expects dispatcher scripts to return
+# quickly, and nm-dispatcher processes scripts for interface events
+# serially, so a slow dispatcher script can delay it from even starting to
+# process the next event.
+
+# Don't react to our own clat tun interface(s) coming up/down to avoid a restart loop
+case "$1" in
+    clat|clat-mms) exit 0 ;;
+esac
+
+# Only interface up/down events matter here.
+[ "$2" != "up" ] && [ "$2" != "down" ] && exit 0
+
+[ -x /usr/libexec/clatd-bearer-manager ] || exit 0
+
+/usr/libexec/clatd-bearer-manager > /dev/null 2>&1 &
+
+exit 0
