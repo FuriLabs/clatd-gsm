@@ -281,6 +281,34 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     ensure_mms_outbound_route(mms_iface, src_addr)
     systemd.restart(unit)
 
+def ensure_nat64_prefix_routes(iface, prefix=None):
+    """
+    Route NAT64/DNS64-synthesized destinations via the cellular interface.
+
+    This device is routinely Wi-Fi + cellular dual-connected, and Wi-Fi's
+    default route is normally preferred for general traffic. Anything
+    synthesized against the carrier's own NAT64 prefix (used both by
+    clatd's own translation and, independently, by any client - e.g.
+    mmsd - that resolves a hostname to a DNS64-synthesized address and
+    connects to it natively over IPv6, no CLAT involved) has no path back
+    when it falls through to Wi-Fi, since that prefix only means anything
+    to the carrier's own network. Without an explicit route here, this
+    class of traffic silently fails the moment Wi-Fi is connected.
+
+    Two prefixes are routed:
+      - 64:ff9b::/96, the RFC 6052 well-known prefix - static, since some
+        resolvers (systemd-resolved's own local DNS64 stub, notably)
+        synthesize against this fixed prefix instead of asking the
+        carrier's resolver to do it server-side.
+      - Whatever prefix the carrier's own resolver is actually using,
+        when known - discovered from clatd's own fwmark rule, since
+        that's the same prefix clatd already confirmed live traffic
+        against for its own translation.
+    """
+    run_ip("-6", "route", "replace", "64:ff9b::/96", "dev", iface)
+    if prefix:
+        run_ip("-6", "route", "replace", prefix, "dev", iface)
+
 def manage_cellular(iface, systemd, dns64_servers):
     unit = f"clatd@{iface}.service"
 
@@ -288,6 +316,7 @@ def manage_cellular(iface, systemd, dns64_servers):
 
     src_addr = wait_for_addr(iface)
     add_dns64_routes(iface, src_addr, dns64_servers)
+    ensure_nat64_prefix_routes(iface)
     systemd.restart(unit)
 
     # Watch for up to 20s and correct clatd's self-selected address if
@@ -295,6 +324,7 @@ def manage_cellular(iface, systemd, dns64_servers):
     # invocation (e.g. a "down" then "up" pair from the same reconnect) can
     # restart clatd again after we've already corrected it.
     fixed_once = False
+    routed_prefix = None
     for _ in range(20):
         time.sleep(1)
         if not systemd.is_active(unit):
@@ -311,6 +341,10 @@ def manage_cellular(iface, systemd, dns64_servers):
         if not m:
             continue
         prefix, picked_addr = m.group(1), m.group(2)
+
+        if prefix != routed_prefix:
+            ensure_nat64_prefix_routes(iface, prefix)
+            routed_prefix = prefix
 
         real_addr = ipv6_global_addr(iface)
         if not real_addr:
