@@ -309,8 +309,55 @@ def ensure_nat64_prefix_routes(iface, prefix=None):
     if prefix:
         run_ip("-6", "route", "replace", prefix, "dev", iface)
 
+def default_route_iface(family="-6"):
+    """
+    The interface currently carrying the default route, or None.
+    """
+    result = subprocess.run(
+        ["ip", family, "route", "show", "default"], capture_output=True, text=True
+    )
+    for line in result.stdout.split("\n"):
+        fields = line.split()
+        if "dev" in fields:
+            return fields[fields.index("dev") + 1]
+    return None
+
+def bearer_iface_is_current(iface, attempts=5, delay=1):
+    """
+    Whether iface is the one actually carrying traffic right now.
+
+    oFono's reported context interface and the kernel's default route can
+    disagree while a bearer is moving between ccmni devices. Configuring
+    clatd for the interface oFono names during that window leaves the CLAT
+    and its routes pinned to a device that no longer carries anything -
+    the host's own native IPv6 keeps working over the real interface, so
+    nothing looks wrong locally, while every translated IPv4 flow is
+    silently dead. Forwarded traffic feels this immediately: a tethered
+    client sees the connection go dead and, on Android, drops back to its
+    own mobile data within seconds.
+
+    A missing default route is not treated as a mismatch. It legitimately
+    happens before NetworkManager has finished applying the bearer's
+    configuration, and refusing to act then would leave clatd down with
+    nothing scheduled to bring it up.
+    """
+    for i in range(attempts):
+        routed = default_route_iface()
+        if routed is None or routed == iface:
+            return True
+        if i + 1 < attempts:
+            time.sleep(delay)
+
+    return False
+
 def manage_cellular(iface, systemd, dns64_servers):
     unit = f"clatd@{iface}.service"
+
+    if not bearer_iface_is_current(iface):
+        # Mid-rotation: leave the existing setup alone rather than pinning it
+        # to an interface the kernel is not routing through. The dispatcher
+        # fires again once the move settles.
+        return
 
     write_clatd_conf(iface, dns64_servers)
 
