@@ -40,11 +40,68 @@ MMS_CLAT_DEV = "clat-mms"
 MMS_CLAT_V4_ADDR = "192.0.0.2"
 MMS_ROUTE_TABLE = 49576
 
+# TAYGA copies the IPv4 TTL into the IPv6 hop limit and decrements it on
+# translation, so traffic entering the CLAT at the Linux default of 64 leaves
+# at 62.
+#
+# At least one carrier (T-Mobile US, observed) drops translated packets whose
+# hop limit is below 64: measured 0/5 success at 60, 62 and 63 against 5/5 at
+# 64 and 65, with the reply path showing the NAT64 only ~13 hops away, so the
+# packets are being filtered rather than expiring. The device's own native
+# IPv6 is unaffected because the carrier's router advertisement sets 255.
+#
+# Entering the CLAT at 66 therefore lands egress at 64 - exactly the value the
+# device's own IPv4 already carries, and nothing more.
+CLAT_TTL = 66
+
+# The default clat-dev, i.e. the cellular instance. Scoping every rule to this
+# device is what makes the whole thing inert on carriers that provide native
+# IPv4: no CLAT, no such interface, nothing matches.
+DEFAULT_CLAT_DEV = "clat"
+
+# Andromeda (the Android app container) is IPv4-only and its traffic is
+# forwarded rather than locally generated, so it arrives at the CLAT already
+# decremented and lands below the carrier's threshold. It is on-device app
+# usage, so compensating it restores parity with a native Android handset,
+# which does 464XLAT in the modem and never decrements at all.
+ANDROMEDA_SUBNET = "192.168.240.0/24"
+
 CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
 IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
 
 def run_ip(*args):
     subprocess.run(["ip", *args], capture_output=True)
+
+def ensure_mangle_rule(*rule):
+    """
+    Append a mangle rule unless it is already present.
+
+    iptables accepts rules naming an interface that does not exist yet, so
+    these can be installed before clatd has created the CLAT device without
+    having to order against it.
+    """
+    check = subprocess.run(
+        ["iptables", "-t", "mangle", "-C", *rule], capture_output=True
+    )
+    if check.returncode != 0:
+        subprocess.run(["iptables", "-t", "mangle", "-A", *rule], capture_output=True)
+
+def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV):
+    """
+    Compensate TAYGA's decrement for on-device traffic entering the CLAT.
+
+    Deliberately limited to traffic that originates on the device:
+
+      - OUTPUT covers the host's own IPv4.
+      - FORWARD covers Andromeda's subnet only.
+    """
+    ensure_mangle_rule(
+        "OUTPUT", "-o", clat_dev, "-j", "TTL", "--ttl-set", str(CLAT_TTL)
+    )
+    ensure_mangle_rule(
+        "FORWARD", "-s", ANDROMEDA_SUBNET, "-o", clat_dev,
+        "-j", "TTL", "--ttl-set", str(CLAT_TTL),
+    )
 
 def ipv6_global_addr(iface):
     result = subprocess.run(
@@ -309,14 +366,62 @@ def ensure_nat64_prefix_routes(iface, prefix=None):
     if prefix:
         run_ip("-6", "route", "replace", prefix, "dev", iface)
 
+def default_route_iface(family="-6"):
+    """
+    The interface currently carrying the default route, or None.
+    """
+    result = subprocess.run(
+        ["ip", family, "route", "show", "default"], capture_output=True, text=True
+    )
+    for line in result.stdout.split("\n"):
+        fields = line.split()
+        if "dev" in fields:
+            return fields[fields.index("dev") + 1]
+    return None
+
+def bearer_iface_is_current(iface, attempts=5, delay=1):
+    """
+    Whether iface is the one actually carrying traffic right now.
+
+    oFono's reported context interface and the kernel's default route can
+    disagree while a bearer is moving between ccmni devices. Configuring
+    clatd for the interface oFono names during that window leaves the CLAT
+    and its routes pinned to a device that no longer carries anything -
+    the host's own native IPv6 keeps working over the real interface, so
+    nothing looks wrong locally, while every translated IPv4 flow is
+    silently dead. Forwarded traffic feels this immediately: a tethered
+    client sees the connection go dead and, on Android, drops back to its
+    own mobile data within seconds.
+
+    A missing default route is not treated as a mismatch. It legitimately
+    happens before NetworkManager has finished applying the bearer's
+    configuration, and refusing to act then would leave clatd down with
+    nothing scheduled to bring it up.
+    """
+    for i in range(attempts):
+        routed = default_route_iface()
+        if routed is None or routed == iface:
+            return True
+        if i + 1 < attempts:
+            time.sleep(delay)
+
+    return False
+
 def manage_cellular(iface, systemd, dns64_servers):
     unit = f"clatd@{iface}.service"
+
+    if not bearer_iface_is_current(iface):
+        # Mid-rotation: leave the existing setup alone rather than pinning it
+        # to an interface the kernel is not routing through. The dispatcher
+        # fires again once the move settles.
+        return
 
     write_clatd_conf(iface, dns64_servers)
 
     src_addr = wait_for_addr(iface)
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface)
+    ensure_hoplimit_compat()
     systemd.restart(unit)
 
     # Watch for up to 20s and correct clatd's self-selected address if
