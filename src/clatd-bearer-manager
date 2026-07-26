@@ -86,7 +86,7 @@ def ensure_mangle_rule(*rule):
     if check.returncode != 0:
         subprocess.run(["iptables", "-t", "mangle", "-A", *rule], capture_output=True)
 
-def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV):
+def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV, forward_subnet=ANDROMEDA_SUBNET):
     """
     Compensate TAYGA's decrement for on-device traffic entering the CLAT.
 
@@ -94,14 +94,19 @@ def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV):
 
       - OUTPUT covers the host's own IPv4.
       - FORWARD covers Andromeda's subnet only.
+
+    forward_subnet is None for the MMS instance: mmsd's traffic is
+    host-originated, so it is already covered by OUTPUT, and Andromeda has
+    no path to the MMS bearer at all.
     """
     ensure_mangle_rule(
         "OUTPUT", "-o", clat_dev, "-j", "TTL", "--ttl-set", str(CLAT_TTL)
     )
-    ensure_mangle_rule(
-        "FORWARD", "-s", ANDROMEDA_SUBNET, "-o", clat_dev,
-        "-j", "TTL", "--ttl-set", str(CLAT_TTL),
-    )
+    if forward_subnet:
+        ensure_mangle_rule(
+            "FORWARD", "-s", forward_subnet, "-o", clat_dev,
+            "-j", "TTL", "--ttl-set", str(CLAT_TTL),
+        )
 
 def ipv6_global_addr(iface):
     result = subprocess.run(
@@ -235,6 +240,24 @@ def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_
     with open(f"/etc/clatd/{iface}.conf", "w") as f:
         f.write("\n".join(lines) + "\n")
 
+def configured_clat_v6_addr(iface):
+    """
+    The clat-v6-addr a running instance was started with, or None.
+
+    clatd reads this once at startup, so the value in the generated conf is
+    what the live translator is actually using - which is the only way to tell
+    from outside whether it has gone stale against the interface.
+    """
+    try:
+        with open(f"/etc/clatd/{iface}.conf") as f:
+            for line in f:
+                key, _, value = line.partition("=")
+                if key.strip() == "clat-v6-addr":
+                    return value.strip()
+    except OSError:
+        pass
+    return None
+
 def add_dns64_routes(iface, src_addr, dns64_servers):
     for dns in dns64_servers:
         args = ["-6", "route", "replace", f"{dns}/128", "dev", iface]
@@ -282,6 +305,20 @@ def ensure_mms_outbound_route(iface, src_addr):
     if not has_current:
         run_ip("-6", "rule", "add", "from", src_addr, "lookup", str(MMS_ROUTE_TABLE))
 
+    # clatd installs its own return-path rule ("from <plat-prefix> to
+    # <clat-v6-addr>") and removes it on a clean stop, but a bearer that
+    # re-activates leaves the old one behind for an address the interface no
+    # longer has. They accumulate one per re-activation and each is a dead
+    # entry, so drop any that do not name the current address.
+    return_rule_re = re.compile(
+        r"^\d+:\s*from (\S+) to (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$"
+    )
+    for line in existing.splitlines():
+        m = return_rule_re.match(line.strip())
+        if m and m.group(2) != src_addr:
+            run_ip("-6", "rule", "del", "from", m.group(1), "to", m.group(2),
+                   "lookup", str(MMS_ROUTE_TABLE))
+
 def manage_mms(systemd, mms_iface, dns64_servers):
     """
     Give the MMS APN context its own clatd instance, separate from the
@@ -315,11 +352,29 @@ def manage_mms(systemd, mms_iface, dns64_servers):
             systemd.stop(unit)
         return
 
+    # The MMS bearer is IPv6-only, so mmsd reaches the MMSC's IPv4 address
+    # through clat-mms - and that traffic is subject to the same carrier
+    # hop-limit threshold as the cellular CLAT, which TAYGA's decrement would
+    # otherwise leave it below. Whether the MMSC path enforces the threshold
+    # today is unclear (it currently works without this), but an uncovered
+    # translator sitting one hop under a known drop threshold is not a state
+    # worth relying on. iptables accepts a rule naming an interface that does
+    # not exist yet, so this can run before clatd creates the device.
+    ensure_hoplimit_compat(MMS_CLAT_DEV, forward_subnet=None)
+
     if systemd.is_active(unit):
         src_addr = ipv6_global_addr(mms_iface)
-        if src_addr:
+        if src_addr and configured_clat_v6_addr(mms_iface) == src_addr:
             ensure_mms_outbound_route(mms_iface, src_addr)
-        return
+            return
+
+        # The bearer re-activated under a running instance and came back with a
+        # different address. clatd took its own clat-v6-addr at startup and has
+        # no way to learn the new one, so the translator and the return-path
+        # rule it installed both still name an address the interface no longer
+        # has: every MMS flow through the CLAT is silently dead, while the
+        # outbound rule above looks correct. Rebuild rather than return.
+        systemd.stop(unit)
 
     src_addr = wait_for_addr(mms_iface)
     if not src_addr:
@@ -409,6 +464,16 @@ def bearer_iface_is_current(iface, attempts=5, delay=1):
 
 def manage_cellular(iface, systemd, dns64_servers):
     unit = f"clatd@{iface}.service"
+
+    # The NAT64 prefix routes are needed whenever the bearer is configured, not
+    # only when it owns the default route - that is precisely the Wi-Fi-preferred
+    # case they exist for, since a DNS64-synthesized destination means nothing to
+    # any network but the carrier's. Installing them ahead of the rotation guard
+    # keeps them present while Wi-Fi is default; gating on a global address
+    # rather than on the default route avoids pointing them at an interface that
+    # is not actually configured yet.
+    if ipv6_global_addr(iface):
+        ensure_nat64_prefix_routes(iface)
 
     if not bearer_iface_is_current(iface):
         # Mid-rotation: leave the existing setup alone rather than pinning it
