@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Jeffrey Clemmons <jeff@antisocialparadise.net>
+# Copyright (C) 2026 Bardia Moshiri <bardia@furilabs.com>
 """
 Manages per-interface clatd (464XLAT) instances for the cellular data
 bearer and, independently, the MMS bearer
