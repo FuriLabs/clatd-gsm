@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import os
 import re
+import string
 import subprocess
 import syslog
 import time
@@ -568,6 +569,12 @@ def default_route_iface(family="-6"):
             return fields[fields.index("dev") + 1]
     return None
 
+def iface_family(iface):
+    """
+    An interface name with its trailing index removed: ccmni3 -> ccmni.
+    """
+    return iface.rstrip(string.digits)
+
 def bearer_iface_is_current(iface, attempts=5, delay=1):
     """
     Whether iface is the one actually carrying traffic right now.
@@ -587,9 +594,18 @@ def bearer_iface_is_current(iface, attempts=5, delay=1):
     configuration, and refusing to act then would leave clatd down with
     nothing scheduled to bring it up.
     """
+    # Compared by name family rather than a hardcoded list, so ccmni, rmnet
+    # and wwan all work.
+    family = iface_family(iface)
     for i in range(attempts):
         routed = default_route_iface()
-        if routed is None or routed == iface:
+        # Only another cellular interface holding the default route means a
+        # rotation is under way. A non-cellular one means Wi-Fi is simply
+        # preferred, which is not a reason to leave the CLAT down.
+        rotating = (
+            routed is not None and routed != iface and routed.startswith(family)
+        )
+        if not rotating:
             return True
         if i + 1 < attempts:
             time.sleep(delay)
