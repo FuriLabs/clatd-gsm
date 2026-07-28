@@ -82,6 +82,10 @@ PLAT_PREFIX_MAX_AGE = 24 * 3600
 # carrier's real prefix. ensure_nat64_prefix_routes() routes it regardless.
 WELL_KNOWN_PREFIX = "64:ff9b::/96"
 
+# clatd only defaults this on for clat-v6-addr=shared, so pinning the address
+# means setting it back. cfgint() accepts decimal only, as for route-table.
+CLAT_CTMARK = 49575
+
 # Andromeda (the Android app container) is IPv4-only and its traffic is
 # forwarded rather than locally generated, so it arrives at the CLAT already
 # decremented and lands below the carrier's threshold. It is on-device app
@@ -341,7 +345,7 @@ def discover_context(bus, ctx_type, attempts=1, delay=1):
             time.sleep(delay)
     return None, []
 
-def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None, plat_prefix=None):
+def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None, plat_prefix=None, proxynd_enable=None, ctmark=None):
     # clatd runs script-up once every rule and the CLAT device are in place and
     # just before it starts TAYGA, which is exactly when the instance is usable.
     # `|| true` because clatd treats a non-zero script-up as fatal, and
@@ -361,6 +365,10 @@ def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_
         lines.append(f"clat-v6-addr={clat_v6_addr}")
     if route_table is not None:
         lines.append(f"route-table={route_table}")
+    if proxynd_enable is not None:
+        lines.append(f"proxynd-enable={proxynd_enable}")
+    if ctmark is not None:
+        lines.append(f"ctmark={ctmark}")
 
     os.makedirs("/etc/clatd", exist_ok=True)
     with open(f"/etc/clatd/{iface}.conf", "w") as f:
@@ -607,9 +615,25 @@ def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
         # fires again once the move settles.
         return
 
-    write_clatd_conf(iface, dns64_servers, plat_prefix=plat_prefix)
-
     src_addr = wait_for_addr(iface)
+
+    # Nothing material changed. Routes and mangle rules are still refreshed,
+    # all being idempotent.
+    if src_addr and systemd.is_active(unit) and configured_clat_v6_addr(iface) == src_addr:
+        add_dns64_routes(iface, src_addr, dns64_servers)
+        ensure_nat64_prefix_routes(iface, plat_prefix)
+        ensure_hoplimit_compat()
+        log(f"{unit} already current for {src_addr}, not restarting")
+        return
+
+    write_clatd_conf(
+        iface,
+        dns64_servers,
+        plat_prefix=plat_prefix,
+        clat_v6_addr=src_addr,
+        proxynd_enable=0 if src_addr else None,
+        ctmark=CLAT_CTMARK if src_addr else None,
+    )
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface, plat_prefix)
     ensure_hoplimit_compat()
@@ -618,49 +642,6 @@ def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
         # the next start can skip the lookup.
         write_cached_plat_prefix(observed_plat_prefix())
 
-    # Watch for up to 20s and correct clatd's self-selected address if
-    # needed. Keep watching for the full window because a closely-following
-    # invocation (e.g. a "down" then "up" pair from the same reconnect) can
-    # restart clatd again after we've already corrected it.
-    fixed_once = False
-    routed_prefix = None
-    for _ in range(20):
-        time.sleep(1)
-        if not systemd.is_active(unit):
-            return
-
-        rule_output = subprocess.run(
-            ["ip", "-6", "rule", "show"], capture_output=True, text=True
-        ).stdout
-        match = next((line for line in rule_output.splitlines() if "fwmark 0xc1a7" in line), None)
-        if not match:
-            continue
-
-        m = IP6_RULE_RE.search(match)
-        if not m:
-            continue
-        prefix, picked_addr = m.group(1), m.group(2)
-
-        if prefix != routed_prefix:
-            ensure_nat64_prefix_routes(iface, prefix)
-            routed_prefix = prefix
-
-        real_addr = ipv6_global_addr(iface)
-        if not real_addr:
-            continue
-
-        if picked_addr == real_addr:
-            # Correct. Only stop watching if we've never had to fix it,
-            # otherwise keep watching in case a restart is still in flight.
-            if not fixed_once:
-                break
-            time.sleep(2)
-            continue
-
-        run_ip("-6", "route", "replace", prefix, "dev", iface, "src", real_addr)
-        systemd.restart(unit)
-        fixed_once = True
-        time.sleep(2)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
