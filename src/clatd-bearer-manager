@@ -295,7 +295,22 @@ class Systemd:
         )
         return [str(u[0]) for u in units]
 
-def start_clatd(systemd, unit, clat_dev):
+def plat_route_ready(plat_prefix):
+    """
+    Whether a route toward the PLAT exists yet.
+
+    clatd resolves its PLAT-facing device with `ip -6 route get <plat-prefix>`
+    and treats a failure as fatal, so starting without one cannot succeed.
+    """
+    if not plat_prefix:
+        return True
+    destination = plat_prefix.split("/")[0]
+    return subprocess.run(
+        ["ip", "-6", "route", "get", destination], capture_output=True
+    ).returncode == 0
+
+def start_clatd(systemd, unit, clat_dev, plat_prefix=None,
+                attempts=3, retry_delay=1):
     """
     Restart a clatd instance and return once it is ready.
 
@@ -303,11 +318,18 @@ def start_clatd(systemd, unit, clat_dev):
     script-up, so the restart job completes only once the instance is genuinely
     usable, and a failed start is reported at once rather than at the timeout.
     """
-    started = time.monotonic()
-    if systemd.restart_and_wait(unit):
-        log(f"{unit} up, {clat_dev} ready in {time.monotonic() - started:.2f}s")
-        return True
-    log(f"{unit} failed to start")
+    for attempt in range(attempts):
+        if plat_prefix and not plat_route_ready(plat_prefix):
+            log(f"{unit} deferred: no route toward {plat_prefix}")
+        else:
+            started = time.monotonic()
+            if systemd.restart_and_wait(unit):
+                log(f"{unit} up, {clat_dev} ready in {time.monotonic() - started:.2f}s")
+                return True
+        if attempt + 1 < attempts:
+            log(f"{unit} failed to start, retrying")
+            time.sleep(retry_delay)
+    log(f"{unit} failed to start after {attempts} attempts")
     return False
 
 def discover_context(bus, ctx_type, attempts=1, delay=1):
@@ -526,7 +548,7 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     )
     add_dns64_routes(mms_iface, src_addr, dns64_servers)
     ensure_mms_outbound_route(mms_iface, src_addr)
-    start_clatd(systemd, unit, MMS_CLAT_DEV)
+    start_clatd(systemd, unit, MMS_CLAT_DEV, plat_prefix)
 
 def ensure_nat64_prefix_routes(iface, prefix=None):
     """
@@ -653,7 +675,7 @@ def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface, plat_prefix)
     ensure_hoplimit_compat()
-    if start_clatd(systemd, unit, DEFAULT_CLAT_DEV) and not plat_prefix:
+    if start_clatd(systemd, unit, DEFAULT_CLAT_DEV, plat_prefix) and not plat_prefix:
         # clatd ran its own discovery this time. Record what it settled on so
         # the next start can skip the lookup.
         write_cached_plat_prefix(observed_plat_prefix())
