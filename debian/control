@@ -11,4 +11,7 @@ Package: clatd-gsm
 Architecture: all
 Depends: ${misc:Depends},
          clatd,
+         python3,
+         python3-dbus,
+         python3-gi,
 Description: clatd wrapper to make translation available for GSM data and MMS
