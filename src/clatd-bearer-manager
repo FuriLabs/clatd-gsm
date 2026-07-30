@@ -12,12 +12,15 @@ import fcntl
 import os
 import re
 import subprocess
-import sys
+import syslog
 import time
 
 import dbus
 
 LOCK_PATH = "/run/clatd-bearer-manager.lock"
+
+# Reaches the journal as `journalctl -t clatd-bearer-manager`.
+LOG_TAG = "clatd-bearer-manager"
 
 OFONO_BUS = "org.ofono"
 OFONO_MANAGER_IFACE = "org.ofono.Manager"
@@ -71,6 +74,10 @@ ANDROMEDA_SUBNET = "192.168.240.0/24"
 
 CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
 IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
+
+def log(message):
+    syslog.syslog(syslog.LOG_INFO, message)
+    print(message)
 
 def run_ip(*args):
     subprocess.run(["ip", *args], capture_output=True)
@@ -548,10 +555,13 @@ def parse_args():
 def main():
     args = parse_args()
 
+    syslog.openlog(LOG_TAG, syslog.LOG_PID, syslog.LOG_DAEMON)
+
     lock_file = open(LOCK_PATH, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        log("another instance holds the lock, skipping this invocation")
         return
 
     try:
@@ -565,11 +575,14 @@ def main():
         else:
             cellular_iface, cellular_dns64 = discover_context(bus, "internet", attempts=8, delay=1)
 
+        log(f"bearers: internet={cellular_iface or '-'} mms={mms_iface or '-'}")
+
         if not args.mms_only:
             wanted = {iface for iface in (cellular_iface, mms_iface) if iface}
             for unit in systemd.clatd_units():
                 m = CLATD_UNIT_RE.match(unit)
                 if m and m.group(1) not in wanted:
+                    log(f"stopping stale {unit}")
                     systemd.stop(unit)
 
         if mms_iface:
@@ -581,7 +594,7 @@ def main():
         if cellular_iface:
             manage_cellular(cellular_iface, systemd, cellular_dns64)
     except dbus.exceptions.DBusException as error:
-        print(f"clatd-bearer-manager: D-Bus error: {error}", file=sys.stderr)
+        log(f"D-Bus error: {error}")
 
 if __name__ == "__main__":
     main()
