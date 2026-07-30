@@ -87,6 +87,9 @@ WELL_KNOWN_PREFIX = "64:ff9b::/96"
 # means setting it back. cfgint() accepts decimal only, as for route-table.
 CLAT_CTMARK = 49575
 
+# clatd's default route-table, same numeric value as its default ctmark.
+CLAT_ROUTE_TABLE = 49575
+
 # Andromeda (the Android app container) is IPv4-only and its traffic is
 # forwarded rather than locally generated, so it arrives at the CLAT already
 # decremented and lands below the carrier's threshold. It is on-device app
@@ -309,7 +312,32 @@ def plat_route_ready(plat_prefix):
         ["ip", "-6", "route", "get", destination], capture_output=True
     ).returncode == 0
 
-def start_clatd(systemd, unit, clat_dev, plat_prefix=None,
+def prune_return_path_rules(route_table):
+    """
+    clatd removes its return-path rule only on a clean exit, and re-adding an
+    identical one fails with EEXIST.
+
+    Every rule selecting on both source and destination goes: those are the
+    return-path rules, and the instance owns all of them in its own table. The
+    MMS instance's outbound rule selects on source alone and stays.
+    """
+    existing = subprocess.run(
+        ["ip", "-6", "rule", "show"], capture_output=True, text=True
+    ).stdout
+    pattern = re.compile(
+        r"^\d+:\s*from (\S+) to (\S+)(.*?)lookup " + str(route_table) + r"\s*$"
+    )
+    for line in existing.splitlines():
+        m = pattern.match(line.strip())
+        if not m:
+            continue
+        args = ["-6", "rule", "del", "prio", "0", "from", m.group(1), "to", m.group(2)]
+        fwmark = re.search(r"fwmark (\S+)", m.group(3))
+        if fwmark:
+            args += ["fwmark", fwmark.group(1)]
+        run_ip(*args, "table", str(route_table))
+
+def start_clatd(systemd, unit, clat_dev, plat_prefix=None, route_table=None,
                 attempts=3, retry_delay=1):
     """
     Restart a clatd instance and return once it is ready.
@@ -322,6 +350,8 @@ def start_clatd(systemd, unit, clat_dev, plat_prefix=None,
         if plat_prefix and not plat_route_ready(plat_prefix):
             log(f"{unit} deferred: no route toward {plat_prefix}")
         else:
+            if route_table is not None:
+                prune_return_path_rules(route_table)
             started = time.monotonic()
             if systemd.restart_and_wait(unit):
                 log(f"{unit} up, {clat_dev} ready in {time.monotonic() - started:.2f}s")
@@ -548,7 +578,7 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     )
     add_dns64_routes(mms_iface, src_addr, dns64_servers)
     ensure_mms_outbound_route(mms_iface, src_addr)
-    start_clatd(systemd, unit, MMS_CLAT_DEV, plat_prefix)
+    start_clatd(systemd, unit, MMS_CLAT_DEV, plat_prefix, MMS_ROUTE_TABLE)
 
 def ensure_nat64_prefix_routes(iface, prefix=None):
     """
@@ -675,7 +705,7 @@ def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface, plat_prefix)
     ensure_hoplimit_compat()
-    if start_clatd(systemd, unit, DEFAULT_CLAT_DEV, plat_prefix) and not plat_prefix:
+    if start_clatd(systemd, unit, DEFAULT_CLAT_DEV, plat_prefix, CLAT_ROUTE_TABLE) and not plat_prefix:
         # clatd ran its own discovery this time. Record what it settled on so
         # the next start can skip the lookup.
         write_cached_plat_prefix(observed_plat_prefix())
