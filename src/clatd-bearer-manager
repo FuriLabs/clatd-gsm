@@ -154,6 +154,12 @@ def run_ip(*args):
     believes. Not fatal - the next dispatcher event gets another go - but it
     should not pass silently.
     """
+    if any(argument is None for argument in args):
+        # A selector the caller could not resolve. Refuse rather than let
+        # subprocess raise, which would abandon the rest of the run and leave
+        # the CLAT unconfigured over one unusable rule.
+        log(f"ip called with an unresolved argument, skipped: {args}")
+        return
     result = subprocess.run(["ip", *args], capture_output=True, text=True)
     if result.returncode:
         detail = result.stderr.strip() or f"exit {result.returncode}"
@@ -531,10 +537,12 @@ def ensure_mms_outbound_route(iface, src_addr):
     # longer has. They accumulate one per re-activation and each is a dead
     # entry, so drop any that do not name the current address.
     for rule in existing:
+        source = rule_prefix(rule, "src")
         destination = rule_prefix(rule, "dst")
-        if destination is not None and destination != current:
-            run_ip("-6", "rule", "del", "from", rule_prefix(rule, "src"),
-                   "to", destination, "lookup", str(MMS_ROUTE_TABLE))
+        if source is None or destination is None or destination == current:
+            continue
+        run_ip("-6", "rule", "del", "from", source,
+               "to", destination, "lookup", str(MMS_ROUTE_TABLE))
 
 def manage_mms(systemd, mms_iface, dns64_servers):
     """
