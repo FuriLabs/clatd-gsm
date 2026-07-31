@@ -289,18 +289,28 @@ class Systemd:
                 outcome["result"] = str(result)
                 loop.quit()
 
+        def on_timeout():
+            # Recorded so the source is not removed twice: GLib drops a
+            # one-shot timeout once it has fired, and removing it again warns.
+            outcome["expired"] = True
+            loop.quit()
+            return False
+
         match = self.bus.add_signal_receiver(
             on_job_removed,
             signal_name="JobRemoved",
             dbus_interface=SYSTEMD_MANAGER_IFACE,
         )
-        expiry = GLib.timeout_add_seconds(timeout, loop.quit)
+        expiry = GLib.timeout_add_seconds(timeout, on_timeout)
         try:
             outcome["path"] = str(self.manager.RestartUnit(unit, "replace"))
             loop.run()
         finally:
-            GLib.source_remove(expiry)
+            if not outcome.get("expired"):
+                GLib.source_remove(expiry)
             match.remove()
+        if outcome.get("expired"):
+            log(f"{unit} did not finish starting within {timeout}s")
         return outcome.get("result") == "done"
 
     def stop(self, unit):
