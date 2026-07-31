@@ -16,6 +16,8 @@ import syslog
 import time
 
 import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
 
 LOCK_PATH = "/run/clatd-bearer-manager.lock"
 
@@ -64,6 +66,11 @@ CLAT_TTL = 66
 # device is what makes the whole thing inert on carriers that provide native
 # IPv4: no CLAT, no such interface, nothing matches.
 DEFAULT_CLAT_DEV = "clat"
+
+# Generous enough to cover a start that still has to discover the PLAT prefix.
+CLATD_START_TIMEOUT = 20
+
+NOTIFY_SCRIPT_UP = "script-up=/usr/bin/systemd-notify --ready || true"
 
 # Andromeda (the Android app container) is IPv4-only and its traffic is
 # forwarded rather than locally generated, so it arrives at the CLAT already
@@ -164,9 +171,37 @@ class Systemd:
         self.manager = dbus.Interface(
             bus.get_object(SYSTEMD_BUS, SYSTEMD_PATH), SYSTEMD_MANAGER_IFACE
         )
+        # JobRemoved is only emitted to subscribers.
+        self.manager.Subscribe()
 
-    def restart(self, unit):
-        self.manager.RestartUnit(unit, "replace")
+    def restart_and_wait(self, unit, timeout=CLATD_START_TIMEOUT):
+        """
+        Restart a unit and block until systemd reports the job finished.
+
+        clatd@.service is Type=notify, so the job completes only once clatd has
+        signalled readiness from its script-up hook.
+        """
+        loop = GLib.MainLoop()
+        outcome = {}
+
+        def on_job_removed(_job_id, job_path, _unit, result):
+            if str(job_path) == outcome.get("path"):
+                outcome["result"] = str(result)
+                loop.quit()
+
+        match = self.bus.add_signal_receiver(
+            on_job_removed,
+            signal_name="JobRemoved",
+            dbus_interface=SYSTEMD_MANAGER_IFACE,
+        )
+        expiry = GLib.timeout_add_seconds(timeout, loop.quit)
+        try:
+            outcome["path"] = str(self.manager.RestartUnit(unit, "replace"))
+            loop.run()
+        finally:
+            GLib.source_remove(expiry)
+            match.remove()
+        return outcome.get("result") == "done"
 
     def stop(self, unit):
         try:
@@ -174,15 +209,18 @@ class Systemd:
         except dbus.exceptions.DBusException:
             pass
 
-    def is_active(self, unit):
+    def get_active_state(self, unit):
         try:
             path = self.manager.GetUnit(unit)
         except dbus.exceptions.DBusException:
-            return False
+            return None
         props = dbus.Interface(
             self.bus.get_object(SYSTEMD_BUS, path), "org.freedesktop.DBus.Properties"
         )
-        return str(props.Get(SYSTEMD_UNIT_IFACE, "ActiveState")) == "active"
+        return str(props.Get(SYSTEMD_UNIT_IFACE, "ActiveState"))
+
+    def is_active(self, unit):
+        return self.get_active_state(unit) == "active"
 
     def clatd_units(self):
         """
@@ -194,6 +232,21 @@ class Systemd:
             dbus.Array([], signature="s"), dbus.Array(["clatd@*"], signature="s")
         )
         return [str(u[0]) for u in units]
+
+def start_clatd(systemd, unit, clat_dev):
+    """
+    Restart a clatd instance and return once it is ready.
+
+    The unit is Type=notify and the generated config makes clatd notify from
+    script-up, so the restart job completes only once the instance is genuinely
+    usable, and a failed start is reported at once rather than at the timeout.
+    """
+    started = time.monotonic()
+    if systemd.restart_and_wait(unit):
+        log(f"{unit} up, {clat_dev} ready in {time.monotonic() - started:.2f}s")
+        return True
+    log(f"{unit} failed to start")
+    return False
 
 def discover_context(bus, ctx_type, attempts=1, delay=1):
     """
@@ -232,7 +285,11 @@ def discover_context(bus, ctx_type, attempts=1, delay=1):
     return None, []
 
 def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None):
-    lines = ["v4-conncheck-enable=0"]
+    # clatd runs script-up once every rule and the CLAT device are in place and
+    # just before it starts TAYGA, which is exactly when the instance is usable.
+    # `|| true` because clatd treats a non-zero script-up as fatal, and
+    # systemd-notify exits 1 when it is run outside systemd.
+    lines = ["v4-conncheck-enable=0", NOTIFY_SCRIPT_UP]
     if dns64_servers:
         lines.append(f"dns64-servers={','.join(dns64_servers)}")
     if not v4_defaultroute_enable:
@@ -401,7 +458,7 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     )
     add_dns64_routes(mms_iface, src_addr, dns64_servers)
     ensure_mms_outbound_route(mms_iface, src_addr)
-    systemd.restart(unit)
+    start_clatd(systemd, unit, MMS_CLAT_DEV)
 
 def ensure_nat64_prefix_routes(iface, prefix=None):
     """
@@ -497,7 +554,7 @@ def manage_cellular(iface, systemd, dns64_servers):
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface)
     ensure_hoplimit_compat()
-    systemd.restart(unit)
+    start_clatd(systemd, unit, DEFAULT_CLAT_DEV)
 
     # Watch for up to 20s and correct clatd's self-selected address if
     # needed. Keep watching for the full window because a closely-following
@@ -556,6 +613,9 @@ def main():
     args = parse_args()
 
     syslog.openlog(LOG_TAG, syslog.LOG_PID, syslog.LOG_DAEMON)
+
+    # Must be installed before the bus connection is made, so signals dispatch.
+    DBusGMainLoop(set_as_default=True)
 
     lock_file = open(LOCK_PATH, "w")
     try:
