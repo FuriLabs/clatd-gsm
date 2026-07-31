@@ -9,6 +9,7 @@ bearer and, independently, the MMS bearer
 
 import argparse
 import fcntl
+import json
 import os
 import re
 import string
@@ -98,7 +99,6 @@ CLAT_ROUTE_TABLE = 49575
 ANDROMEDA_SUBNET = "192.168.240.0/24"
 
 CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
-IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
 
 def read_cached_plat_prefix():
     """
@@ -136,15 +136,10 @@ def observed_plat_prefix():
     no fwmark rule - but both bearers face the same carrier, so one answer
     serves both.
     """
-    rules = subprocess.run(
-        ["ip", "-6", "rule", "show"], capture_output=True, text=True
-    ).stdout
-    for line in rules.splitlines():
-        if "fwmark 0xc1a7" not in line:
-            continue
-        m = IP6_RULE_RE.search(line)
-        if m:
-            return m.group(1)
+    for rule in rules_in_table(CLAT_ROUTE_TABLE):
+        fwmark = rule.get("fwmark")
+        if fwmark and int(fwmark, 16) == CLAT_CTMARK:
+            return rule_prefix(rule, "src")
     return None
 
 def log(message):
@@ -153,6 +148,36 @@ def log(message):
 
 def run_ip(*args):
     subprocess.run(["ip", *args], capture_output=True)
+
+def ip_json(*args):
+    """
+    iproute2's JSON output, so listings do not have to be parsed out of the
+    text form.
+    """
+    result = subprocess.run(["ip", "-j", *args], capture_output=True, text=True)
+    if result.returncode:
+        return []
+    try:
+        return json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+def rule_prefix(rule, key):
+    """
+    A rule's "src" or "dst" selector as address/length.
+
+    iproute2 omits the length when the match is full-length, and reports "all"
+    when the selector is absent altogether.
+    """
+    address = rule.get(key)
+    if not address or address == "all":
+        return None
+    return f"{address}/{rule.get(key + 'len', 128)}"
+
+def rules_in_table(table):
+    for rule in ip_json("-6", "rule", "show"):
+        if str(rule.get("table")) == str(table):
+            yield rule
 
 def ensure_mangle_rule(*rule):
     """
@@ -190,29 +215,18 @@ def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV, forward_subnet=ANDROMEDA_S
             "-j", "TTL", "--ttl-set", str(CLAT_TTL),
         )
 
-def ipv6_global_addr(iface):
-    result = subprocess.run(
-        ["ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global"],
-        capture_output=True,
-        text=True,
-    )
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            return fields[3].split("/")[0]
+def global_addr(iface, family):
+    for link in ip_json(family, "addr", "show", "dev", iface, "scope", "global"):
+        for addr in link.get("addr_info", []):
+            if addr.get("local"):
+                return addr["local"]
     return None
 
+def ipv6_global_addr(iface):
+    return global_addr(iface, "-6")
+
 def ipv4_global_addr(iface):
-    result = subprocess.run(
-        ["ip", "-4", "-o", "addr", "show", "dev", iface, "scope", "global"],
-        capture_output=True,
-        text=True,
-    )
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            return fields[3].split("/")[0]
-    return None
+    return global_addr(iface, "-4")
 
 def wait_for_addr(iface, attempts=5, delay=1):
     """
@@ -321,20 +335,15 @@ def prune_return_path_rules(route_table):
     return-path rules, and the instance owns all of them in its own table. The
     MMS instance's outbound rule selects on source alone and stays.
     """
-    existing = subprocess.run(
-        ["ip", "-6", "rule", "show"], capture_output=True, text=True
-    ).stdout
-    pattern = re.compile(
-        r"^\d+:\s*from (\S+) to (\S+)(.*?)lookup " + str(route_table) + r"\s*$"
-    )
-    for line in existing.splitlines():
-        m = pattern.match(line.strip())
-        if not m:
+    for rule in list(rules_in_table(route_table)):
+        source = rule_prefix(rule, "src")
+        destination = rule_prefix(rule, "dst")
+        if source is None or destination is None:
             continue
-        args = ["-6", "rule", "del", "prio", "0", "from", m.group(1), "to", m.group(2)]
-        fwmark = re.search(r"fwmark (\S+)", m.group(3))
-        if fwmark:
-            args += ["fwmark", fwmark.group(1)]
+        args = ["-6", "rule", "del", "prio", str(rule.get("priority", 0)),
+                "from", source, "to", destination]
+        if rule.get("fwmark"):
+            args += ["fwmark", rule["fwmark"]]
         run_ip(*args, "table", str(route_table))
 
 def start_clatd(systemd, unit, clat_dev, plat_prefix=None, route_table=None,
@@ -476,19 +485,18 @@ def ensure_mms_outbound_route(iface, src_addr):
     rules of the form "from <addr> lookup <table>"
     """
     run_ip("-6", "route", "replace", "default", "dev", iface, "table", str(MMS_ROUTE_TABLE))
-    outbound_rule_re = re.compile(r"^\d+:\s*from (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$")
-    existing = subprocess.run(
-        ["ip", "-6", "rule", "show"], capture_output=True, text=True
-    ).stdout
+    existing = list(rules_in_table(MMS_ROUTE_TABLE))
+    current = f"{src_addr}/128"
     has_current = False
-    for line in existing.splitlines():
-        m = outbound_rule_re.match(line.strip())
-        if not m:
+    for rule in existing:
+        source = rule_prefix(rule, "src")
+        if source is None or rule_prefix(rule, "dst") is not None:
             continue
-        if m.group(1) == src_addr:
+        if source == current:
             has_current = True
         else:
-            run_ip("-6", "rule", "del", "from", m.group(1), "lookup", str(MMS_ROUTE_TABLE))
+            run_ip("-6", "rule", "del", "from", source,
+                   "lookup", str(MMS_ROUTE_TABLE))
     if not has_current:
         run_ip("-6", "rule", "add", "from", src_addr, "lookup", str(MMS_ROUTE_TABLE))
 
@@ -497,14 +505,11 @@ def ensure_mms_outbound_route(iface, src_addr):
     # re-activates leaves the old one behind for an address the interface no
     # longer has. They accumulate one per re-activation and each is a dead
     # entry, so drop any that do not name the current address.
-    return_rule_re = re.compile(
-        r"^\d+:\s*from (\S+) to (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$"
-    )
-    for line in existing.splitlines():
-        m = return_rule_re.match(line.strip())
-        if m and m.group(2) != src_addr:
-            run_ip("-6", "rule", "del", "from", m.group(1), "to", m.group(2),
-                   "lookup", str(MMS_ROUTE_TABLE))
+    for rule in existing:
+        destination = rule_prefix(rule, "dst")
+        if destination is not None and destination != current:
+            run_ip("-6", "rule", "del", "from", rule_prefix(rule, "src"),
+                   "to", destination, "lookup", str(MMS_ROUTE_TABLE))
 
 def manage_mms(systemd, mms_iface, dns64_servers):
     """
@@ -612,13 +617,9 @@ def default_route_iface(family="-6"):
     """
     The interface currently carrying the default route, or None.
     """
-    result = subprocess.run(
-        ["ip", family, "route", "show", "default"], capture_output=True, text=True
-    )
-    for line in result.stdout.split("\n"):
-        fields = line.split()
-        if "dev" in fields:
-            return fields[fields.index("dev") + 1]
+    for route in ip_json(family, "route", "show", "default"):
+        if route.get("dev"):
+            return route["dev"]
     return None
 
 def iface_family(iface):
