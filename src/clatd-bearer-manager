@@ -133,8 +133,7 @@ def observed_plat_prefix():
 
     Only the cellular instance produces this rule - it keeps clatd's default
     ctmark, whereas the MMS instance pins clat-v6-addr and so gets ctmark 0 and
-    no fwmark rule - but both bearers face the same carrier, so one answer
-    serves both.
+    no fwmark rule.
     """
     for rule in rules_in_table(CLAT_ROUTE_TABLE):
         fwmark = rule.get("fwmark")
@@ -407,7 +406,7 @@ def discover_context(bus, ctx_type, attempts=1, delay=1):
             time.sleep(delay)
     return None, []
 
-def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None, plat_prefix=None, proxynd_enable=None, ctmark=None):
+def clatd_conf(dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None, plat_prefix=None, proxynd_enable=None, ctmark=None):
     # clatd runs script-up once every rule and the CLAT device are in place and
     # just before it starts TAYGA, which is exactly when the instance is usable.
     # `|| true` because clatd treats a non-zero script-up as fatal, and
@@ -432,27 +431,37 @@ def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_
     if ctmark is not None:
         lines.append(f"ctmark={ctmark}")
 
-    os.makedirs("/etc/clatd", exist_ok=True)
-    with open(f"/etc/clatd/{iface}.conf", "w") as f:
-        f.write("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
-def configured_clat_v6_addr(iface):
+def write_clatd_conf(iface, contents):
     """
-    The clat-v6-addr a running instance was started with, or None.
-
-    clatd reads this once at startup, so the value in the generated conf is
-    what the live translator is actually using - which is the only way to tell
-    from outside whether it has gone stale against the interface.
+    Write an instance's config, reporting whether it differed from what was
+    already there. Callers restart on any difference.
     """
+    path = f"/etc/clatd/{iface}.conf"
     try:
-        with open(f"/etc/clatd/{iface}.conf") as f:
-            for line in f:
-                key, _, value = line.partition("=")
-                if key.strip() == "clat-v6-addr":
-                    return value.strip()
+        with open(path) as existing:
+            if existing.read() == contents:
+                return False
     except OSError:
         pass
-    return None
+    os.makedirs("/etc/clatd", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(contents)
+    return True
+
+def cellular_clatd_conf(dns64_servers, src_addr, plat_prefix):
+    """
+    The cellular instance's config. Both callers must generate it identically
+    or write_clatd_conf() reports a difference that is not one.
+    """
+    return clatd_conf(
+        dns64_servers,
+        plat_prefix=plat_prefix,
+        clat_v6_addr=src_addr,
+        proxynd_enable=0,
+        ctmark=CLAT_CTMARK,
+    )
 
 def add_dns64_routes(iface, src_addr, dns64_servers):
     for dns in dns64_servers:
@@ -554,36 +563,29 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     # not exist yet, so this can run before clatd creates the device.
     ensure_hoplimit_compat(MMS_CLAT_DEV, forward_subnet=None)
 
-    if systemd.is_active(unit):
-        src_addr = ipv6_global_addr(mms_iface)
-        if src_addr and configured_clat_v6_addr(mms_iface) == src_addr:
-            ensure_mms_outbound_route(mms_iface, src_addr)
-            return
-
-        # The bearer re-activated under a running instance and came back with a
-        # different address. clatd took its own clat-v6-addr at startup and has
-        # no way to learn the new one, so the translator and the return-path
-        # rule it installed both still name an address the interface no longer
-        # has: every MMS flow through the CLAT is silently dead, while the
-        # outbound rule above looks correct. Rebuild rather than return.
-        systemd.stop(unit)
-
     src_addr = wait_for_addr(mms_iface)
     if not src_addr:
         return
 
-    write_clatd_conf(
-        mms_iface,
+    changed = write_clatd_conf(mms_iface, clatd_conf(
         dns64_servers,
         v4_defaultroute_enable=False,
         clat_dev=MMS_CLAT_DEV,
         clat_v4_addr=MMS_CLAT_V4_ADDR,
         clat_v6_addr=src_addr,
         route_table=MMS_ROUTE_TABLE,
-    )
+    ))
     add_dns64_routes(mms_iface, src_addr, dns64_servers)
     ensure_mms_outbound_route(mms_iface, src_addr)
-    start_clatd(systemd, unit, MMS_CLAT_DEV, plat_prefix, MMS_ROUTE_TABLE)
+
+    if not changed and systemd.is_active(unit):
+        return
+
+    if systemd.is_active(unit):
+        # clatd reads clat-v6-addr once at startup and cannot learn a new one,
+        # so stop it first and let it remove the rules naming the old address.
+        systemd.stop(unit)
+    start_clatd(systemd, unit, MMS_CLAT_DEV, route_table=MMS_ROUTE_TABLE)
 
 def ensure_nat64_prefix_routes(iface, prefix=None):
     """
@@ -685,31 +687,30 @@ def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
         return
 
     src_addr = wait_for_addr(iface)
-
-    # Nothing material changed. Routes and mangle rules are still refreshed,
-    # all being idempotent.
-    if src_addr and systemd.is_active(unit) and configured_clat_v6_addr(iface) == src_addr:
-        add_dns64_routes(iface, src_addr, dns64_servers)
-        ensure_nat64_prefix_routes(iface, plat_prefix)
-        ensure_hoplimit_compat()
-        log(f"{unit} already current for {src_addr}, not restarting")
+    if not src_addr:
+        log(f"{unit} not started: {iface} has no global address yet")
         return
 
-    write_clatd_conf(
-        iface,
-        dns64_servers,
-        plat_prefix=plat_prefix,
-        clat_v6_addr=src_addr,
-        proxynd_enable=0 if src_addr else None,
-        ctmark=CLAT_CTMARK if src_addr else None,
+    changed = write_clatd_conf(
+        iface, cellular_clatd_conf(dns64_servers, src_addr, plat_prefix)
     )
     add_dns64_routes(iface, src_addr, dns64_servers)
     ensure_nat64_prefix_routes(iface, plat_prefix)
     ensure_hoplimit_compat()
+
+    # Routes and mangle rules above are refreshed either way, all idempotent.
+    if not changed and systemd.is_active(unit):
+        log(f"{unit} already current, not restarting")
+        return
     if start_clatd(systemd, unit, DEFAULT_CLAT_DEV, plat_prefix, CLAT_ROUTE_TABLE) and not plat_prefix:
-        # clatd ran its own discovery this time. Record what it settled on so
-        # the next start can skip the lookup.
+        # clatd discovered the prefix itself, so it is in neither the cache
+        # nor the conf this instance was started from. Record it in both.
         write_cached_plat_prefix(observed_plat_prefix())
+        learned = read_cached_plat_prefix()
+        if learned:
+            write_clatd_conf(
+                iface, cellular_clatd_conf(dns64_servers, src_addr, learned)
+            )
 
 
 def parse_args():
