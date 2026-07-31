@@ -146,7 +146,18 @@ def log(message):
     print(message)
 
 def run_ip(*args):
-    subprocess.run(["ip", *args], capture_output=True)
+    """
+    Run an ip command, reporting a failure rather than discarding it.
+
+    Every caller acts on something it has just read back, so a failure here
+    means the two disagree and the routing state is not what the caller
+    believes. Not fatal - the next dispatcher event gets another go - but it
+    should not pass silently.
+    """
+    result = subprocess.run(["ip", *args], capture_output=True, text=True)
+    if result.returncode:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        log(f"ip {' '.join(args)}: {detail}")
 
 def ip_json(*args):
     """
@@ -190,7 +201,12 @@ def ensure_mangle_rule(*rule):
         ["iptables", "-t", "mangle", "-C", *rule], capture_output=True
     )
     if check.returncode != 0:
-        subprocess.run(["iptables", "-t", "mangle", "-A", *rule], capture_output=True)
+        result = subprocess.run(
+            ["iptables", "-t", "mangle", "-A", *rule], capture_output=True, text=True
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or f"exit {result.returncode}"
+            log(f"iptables -t mangle -A {' '.join(rule)}: {detail}")
 
 def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV, forward_subnet=ANDROMEDA_SUBNET):
     """
