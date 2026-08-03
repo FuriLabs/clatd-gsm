@@ -9,15 +9,22 @@ bearer and, independently, the MMS bearer
 
 import argparse
 import fcntl
+import json
 import os
 import re
+import string
 import subprocess
-import sys
+import syslog
 import time
 
 import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
 
 LOCK_PATH = "/run/clatd-bearer-manager.lock"
+
+# Reaches the journal as `journalctl -t clatd-bearer-manager`.
+LOG_TAG = "clatd-bearer-manager"
 
 OFONO_BUS = "org.ofono"
 OFONO_MANAGER_IFACE = "org.ofono.Manager"
@@ -62,6 +69,28 @@ CLAT_TTL = 66
 # IPv4: no CLAT, no such interface, nothing matches.
 DEFAULT_CLAT_DEV = "clat"
 
+# Generous enough to cover a start that still has to discover the PLAT prefix.
+CLATD_START_TIMEOUT = 20
+
+NOTIFY_SCRIPT_UP = "script-up=/usr/bin/systemd-notify --ready || true"
+
+# Setting plat-prefix makes clatd skip RFC 7050 discovery entirely.
+PLAT_PREFIX_CACHE = "/var/lib/clatd-gsm/plat-prefix"
+
+# Bounded staleness: a carrier that renumbers costs one slow start per day.
+PLAT_PREFIX_MAX_AGE = 24 * 3600
+
+# Never cached: a local DNS64 stub synthesizes against this rather than the
+# carrier's real prefix. ensure_nat64_prefix_routes() routes it regardless.
+WELL_KNOWN_PREFIX = "64:ff9b::/96"
+
+# clatd only defaults this on for clat-v6-addr=shared, so pinning the address
+# means setting it back. cfgint() accepts decimal only, as for route-table.
+CLAT_CTMARK = 49575
+
+# clatd's default route-table, same numeric value as its default ctmark.
+CLAT_ROUTE_TABLE = 49575
+
 # Andromeda (the Android app container) is IPv4-only and its traffic is
 # forwarded rather than locally generated, so it arrives at the CLAT already
 # decremented and lands below the carrier's threshold. It is on-device app
@@ -70,10 +99,101 @@ DEFAULT_CLAT_DEV = "clat"
 ANDROMEDA_SUBNET = "192.168.240.0/24"
 
 CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
-IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
+
+def read_cached_plat_prefix():
+    """
+    The last known-good PLAT prefix, or None if unknown or too old.
+    """
+    try:
+        age = time.time() - os.path.getmtime(PLAT_PREFIX_CACHE)
+        if age > PLAT_PREFIX_MAX_AGE:
+            return None
+        with open(PLAT_PREFIX_CACHE) as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def write_cached_plat_prefix(prefix):
+    if not prefix or prefix == WELL_KNOWN_PREFIX:
+        return
+    if prefix == read_cached_plat_prefix():
+        return
+    try:
+        os.makedirs(os.path.dirname(PLAT_PREFIX_CACHE), exist_ok=True)
+        with open(PLAT_PREFIX_CACHE, "w") as f:
+            f.write(prefix + "\n")
+        log(f"cached PLAT prefix {prefix}")
+    except OSError as error:
+        log(f"could not cache PLAT prefix: {error}")
+
+def observed_plat_prefix():
+    """
+    The PLAT prefix the running cellular clatd instance actually settled on,
+    read back from the ip rule it installs for the return path.
+
+    Only the cellular instance produces this rule - it keeps clatd's default
+    ctmark, whereas the MMS instance pins clat-v6-addr and so gets ctmark 0 and
+    no fwmark rule.
+    """
+    for rule in rules_in_table(CLAT_ROUTE_TABLE):
+        fwmark = rule.get("fwmark")
+        if fwmark and int(fwmark, 16) == CLAT_CTMARK:
+            return rule_prefix(rule, "src")
+    return None
+
+def log(message):
+    syslog.syslog(syslog.LOG_INFO, message)
+    print(message)
 
 def run_ip(*args):
-    subprocess.run(["ip", *args], capture_output=True)
+    """
+    Run an ip command, reporting a failure rather than discarding it.
+
+    Every caller acts on something it has just read back, so a failure here
+    means the two disagree and the routing state is not what the caller
+    believes. Not fatal - the next dispatcher event gets another go - but it
+    should not pass silently.
+    """
+    if any(argument is None for argument in args):
+        # A selector the caller could not resolve. Refuse rather than let
+        # subprocess raise, which would abandon the rest of the run and leave
+        # the CLAT unconfigured over one unusable rule.
+        log(f"ip called with an unresolved argument, skipped: {args}")
+        return
+    result = subprocess.run(["ip", *args], capture_output=True, text=True)
+    if result.returncode:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        log(f"ip {' '.join(args)}: {detail}")
+
+def ip_json(*args):
+    """
+    iproute2's JSON output, so listings do not have to be parsed out of the
+    text form.
+    """
+    result = subprocess.run(["ip", "-j", *args], capture_output=True, text=True)
+    if result.returncode:
+        return []
+    try:
+        return json.loads(result.stdout or "[]")
+    except json.JSONDecodeError:
+        return []
+
+def rule_prefix(rule, key):
+    """
+    A rule's "src" or "dst" selector as address/length.
+
+    iproute2 omits the length when the match is full-length, and reports "all"
+    when the selector is absent altogether.
+    """
+    address = rule.get(key)
+    if not address or address == "all":
+        return None
+    return f"{address}/{rule.get(key + 'len', 128)}"
+
+def rules_in_table(table):
+    for rule in ip_json("-6", "rule", "show"):
+        if str(rule.get("table")) == str(table):
+            yield rule
 
 def ensure_mangle_rule(*rule):
     """
@@ -87,7 +207,12 @@ def ensure_mangle_rule(*rule):
         ["iptables", "-t", "mangle", "-C", *rule], capture_output=True
     )
     if check.returncode != 0:
-        subprocess.run(["iptables", "-t", "mangle", "-A", *rule], capture_output=True)
+        result = subprocess.run(
+            ["iptables", "-t", "mangle", "-A", *rule], capture_output=True, text=True
+        )
+        if result.returncode:
+            detail = result.stderr.strip() or f"exit {result.returncode}"
+            log(f"iptables -t mangle -A {' '.join(rule)}: {detail}")
 
 def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV, forward_subnet=ANDROMEDA_SUBNET):
     """
@@ -111,29 +236,18 @@ def ensure_hoplimit_compat(clat_dev=DEFAULT_CLAT_DEV, forward_subnet=ANDROMEDA_S
             "-j", "TTL", "--ttl-set", str(CLAT_TTL),
         )
 
-def ipv6_global_addr(iface):
-    result = subprocess.run(
-        ["ip", "-6", "-o", "addr", "show", "dev", iface, "scope", "global"],
-        capture_output=True,
-        text=True,
-    )
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            return fields[3].split("/")[0]
+def global_addr(iface, family):
+    for link in ip_json(family, "addr", "show", "dev", iface, "scope", "global"):
+        for addr in link.get("addr_info", []):
+            if addr.get("local"):
+                return addr["local"]
     return None
 
+def ipv6_global_addr(iface):
+    return global_addr(iface, "-6")
+
 def ipv4_global_addr(iface):
-    result = subprocess.run(
-        ["ip", "-4", "-o", "addr", "show", "dev", iface, "scope", "global"],
-        capture_output=True,
-        text=True,
-    )
-    for line in result.stdout.splitlines():
-        fields = line.split()
-        if len(fields) >= 4:
-            return fields[3].split("/")[0]
-    return None
+    return global_addr(iface, "-4")
 
 def wait_for_addr(iface, attempts=5, delay=1):
     """
@@ -157,9 +271,47 @@ class Systemd:
         self.manager = dbus.Interface(
             bus.get_object(SYSTEMD_BUS, SYSTEMD_PATH), SYSTEMD_MANAGER_IFACE
         )
+        # JobRemoved is only emitted to subscribers.
+        self.manager.Subscribe()
 
-    def restart(self, unit):
-        self.manager.RestartUnit(unit, "replace")
+    def restart_and_wait(self, unit, timeout=CLATD_START_TIMEOUT):
+        """
+        Restart a unit and block until systemd reports the job finished.
+
+        clatd@.service is Type=notify, so the job completes only once clatd has
+        signalled readiness from its script-up hook.
+        """
+        loop = GLib.MainLoop()
+        outcome = {}
+
+        def on_job_removed(_job_id, job_path, _unit, result):
+            if str(job_path) == outcome.get("path"):
+                outcome["result"] = str(result)
+                loop.quit()
+
+        def on_timeout():
+            # Recorded so the source is not removed twice: GLib drops a
+            # one-shot timeout once it has fired, and removing it again warns.
+            outcome["expired"] = True
+            loop.quit()
+            return False
+
+        match = self.bus.add_signal_receiver(
+            on_job_removed,
+            signal_name="JobRemoved",
+            dbus_interface=SYSTEMD_MANAGER_IFACE,
+        )
+        expiry = GLib.timeout_add_seconds(timeout, on_timeout)
+        try:
+            outcome["path"] = str(self.manager.RestartUnit(unit, "replace"))
+            loop.run()
+        finally:
+            if not outcome.get("expired"):
+                GLib.source_remove(expiry)
+            match.remove()
+        if outcome.get("expired"):
+            log(f"{unit} did not finish starting within {timeout}s")
+        return outcome.get("result") == "done"
 
     def stop(self, unit):
         try:
@@ -167,15 +319,18 @@ class Systemd:
         except dbus.exceptions.DBusException:
             pass
 
-    def is_active(self, unit):
+    def get_active_state(self, unit):
         try:
             path = self.manager.GetUnit(unit)
         except dbus.exceptions.DBusException:
-            return False
+            return None
         props = dbus.Interface(
             self.bus.get_object(SYSTEMD_BUS, path), "org.freedesktop.DBus.Properties"
         )
-        return str(props.Get(SYSTEMD_UNIT_IFACE, "ActiveState")) == "active"
+        return str(props.Get(SYSTEMD_UNIT_IFACE, "ActiveState"))
+
+    def is_active(self, unit):
+        return self.get_active_state(unit) == "active"
 
     def clatd_units(self):
         """
@@ -187,6 +342,65 @@ class Systemd:
             dbus.Array([], signature="s"), dbus.Array(["clatd@*"], signature="s")
         )
         return [str(u[0]) for u in units]
+
+def plat_route_ready(plat_prefix):
+    """
+    Whether a route toward the PLAT exists yet.
+
+    clatd resolves its PLAT-facing device with `ip -6 route get <plat-prefix>`
+    and treats a failure as fatal, so starting without one cannot succeed.
+    """
+    if not plat_prefix:
+        return True
+    destination = plat_prefix.split("/")[0]
+    return subprocess.run(
+        ["ip", "-6", "route", "get", destination], capture_output=True
+    ).returncode == 0
+
+def prune_return_path_rules(route_table):
+    """
+    clatd removes its return-path rule only on a clean exit, and re-adding an
+    identical one fails with EEXIST.
+
+    Every rule selecting on both source and destination goes: those are the
+    return-path rules, and the instance owns all of them in its own table. The
+    MMS instance's outbound rule selects on source alone and stays.
+    """
+    for rule in list(rules_in_table(route_table)):
+        source = rule_prefix(rule, "src")
+        destination = rule_prefix(rule, "dst")
+        if source is None or destination is None:
+            continue
+        args = ["-6", "rule", "del", "prio", str(rule.get("priority", 0)),
+                "from", source, "to", destination]
+        if rule.get("fwmark"):
+            args += ["fwmark", rule["fwmark"]]
+        run_ip(*args, "table", str(route_table))
+
+def start_clatd(systemd, unit, clat_dev, plat_prefix=None, route_table=None,
+                attempts=3, retry_delay=1):
+    """
+    Restart a clatd instance and return once it is ready.
+
+    The unit is Type=notify and the generated config makes clatd notify from
+    script-up, so the restart job completes only once the instance is genuinely
+    usable, and a failed start is reported at once rather than at the timeout.
+    """
+    for attempt in range(attempts):
+        if plat_prefix and not plat_route_ready(plat_prefix):
+            log(f"{unit} deferred: no route toward {plat_prefix}")
+        else:
+            if route_table is not None:
+                prune_return_path_rules(route_table)
+            started = time.monotonic()
+            if systemd.restart_and_wait(unit):
+                log(f"{unit} up, {clat_dev} ready in {time.monotonic() - started:.2f}s")
+                return True
+        if attempt + 1 < attempts:
+            log(f"{unit} failed to start, retrying")
+            time.sleep(retry_delay)
+    log(f"{unit} failed to start after {attempts} attempts")
+    return False
 
 def discover_context(bus, ctx_type, attempts=1, delay=1):
     """
@@ -224,8 +438,14 @@ def discover_context(bus, ctx_type, attempts=1, delay=1):
             time.sleep(delay)
     return None, []
 
-def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None):
-    lines = ["v4-conncheck-enable=0"]
+def clatd_conf(dns64_servers, *, v4_defaultroute_enable=True, clat_dev=None, clat_v4_addr=None, clat_v6_addr=None, route_table=None, plat_prefix=None, proxynd_enable=None, ctmark=None):
+    # clatd runs script-up once every rule and the CLAT device are in place and
+    # just before it starts TAYGA, which is exactly when the instance is usable.
+    # `|| true` because clatd treats a non-zero script-up as fatal, and
+    # systemd-notify exits 1 when it is run outside systemd.
+    lines = ["v4-conncheck-enable=0", NOTIFY_SCRIPT_UP]
+    if plat_prefix:
+        lines.append(f"plat-prefix={plat_prefix}")
     if dns64_servers:
         lines.append(f"dns64-servers={','.join(dns64_servers)}")
     if not v4_defaultroute_enable:
@@ -238,28 +458,42 @@ def write_clatd_conf(iface, dns64_servers, *, v4_defaultroute_enable=True, clat_
         lines.append(f"clat-v6-addr={clat_v6_addr}")
     if route_table is not None:
         lines.append(f"route-table={route_table}")
+    if proxynd_enable is not None:
+        lines.append(f"proxynd-enable={proxynd_enable}")
+    if ctmark is not None:
+        lines.append(f"ctmark={ctmark}")
 
-    os.makedirs("/etc/clatd", exist_ok=True)
-    with open(f"/etc/clatd/{iface}.conf", "w") as f:
-        f.write("\n".join(lines) + "\n")
+    return "\n".join(lines) + "\n"
 
-def configured_clat_v6_addr(iface):
+def write_clatd_conf(iface, contents):
     """
-    The clat-v6-addr a running instance was started with, or None.
-
-    clatd reads this once at startup, so the value in the generated conf is
-    what the live translator is actually using - which is the only way to tell
-    from outside whether it has gone stale against the interface.
+    Write an instance's config, reporting whether it differed from what was
+    already there. Callers restart on any difference.
     """
+    path = f"/etc/clatd/{iface}.conf"
     try:
-        with open(f"/etc/clatd/{iface}.conf") as f:
-            for line in f:
-                key, _, value = line.partition("=")
-                if key.strip() == "clat-v6-addr":
-                    return value.strip()
+        with open(path) as existing:
+            if existing.read() == contents:
+                return False
     except OSError:
         pass
-    return None
+    os.makedirs("/etc/clatd", exist_ok=True)
+    with open(path, "w") as f:
+        f.write(contents)
+    return True
+
+def cellular_clatd_conf(dns64_servers, src_addr, plat_prefix):
+    """
+    The cellular instance's config. Both callers must generate it identically
+    or write_clatd_conf() reports a difference that is not one.
+    """
+    return clatd_conf(
+        dns64_servers,
+        plat_prefix=plat_prefix,
+        clat_v6_addr=src_addr,
+        proxynd_enable=0,
+        ctmark=CLAT_CTMARK,
+    )
 
 def add_dns64_routes(iface, src_addr, dns64_servers):
     for dns in dns64_servers:
@@ -292,19 +526,18 @@ def ensure_mms_outbound_route(iface, src_addr):
     rules of the form "from <addr> lookup <table>"
     """
     run_ip("-6", "route", "replace", "default", "dev", iface, "table", str(MMS_ROUTE_TABLE))
-    outbound_rule_re = re.compile(r"^\d+:\s*from (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$")
-    existing = subprocess.run(
-        ["ip", "-6", "rule", "show"], capture_output=True, text=True
-    ).stdout
+    existing = list(rules_in_table(MMS_ROUTE_TABLE))
+    current = f"{src_addr}/128"
     has_current = False
-    for line in existing.splitlines():
-        m = outbound_rule_re.match(line.strip())
-        if not m:
+    for rule in existing:
+        source = rule_prefix(rule, "src")
+        if source is None or rule_prefix(rule, "dst") is not None:
             continue
-        if m.group(1) == src_addr:
+        if source == current:
             has_current = True
         else:
-            run_ip("-6", "rule", "del", "from", m.group(1), "lookup", str(MMS_ROUTE_TABLE))
+            run_ip("-6", "rule", "del", "from", source,
+                   "lookup", str(MMS_ROUTE_TABLE))
     if not has_current:
         run_ip("-6", "rule", "add", "from", src_addr, "lookup", str(MMS_ROUTE_TABLE))
 
@@ -313,14 +546,13 @@ def ensure_mms_outbound_route(iface, src_addr):
     # re-activates leaves the old one behind for an address the interface no
     # longer has. They accumulate one per re-activation and each is a dead
     # entry, so drop any that do not name the current address.
-    return_rule_re = re.compile(
-        r"^\d+:\s*from (\S+) to (\S+) lookup " + str(MMS_ROUTE_TABLE) + r"\s*$"
-    )
-    for line in existing.splitlines():
-        m = return_rule_re.match(line.strip())
-        if m and m.group(2) != src_addr:
-            run_ip("-6", "rule", "del", "from", m.group(1), "to", m.group(2),
-                   "lookup", str(MMS_ROUTE_TABLE))
+    for rule in existing:
+        source = rule_prefix(rule, "src")
+        destination = rule_prefix(rule, "dst")
+        if source is None or destination is None or destination == current:
+            continue
+        run_ip("-6", "rule", "del", "from", source,
+               "to", destination, "lookup", str(MMS_ROUTE_TABLE))
 
 def manage_mms(systemd, mms_iface, dns64_servers):
     """
@@ -365,36 +597,29 @@ def manage_mms(systemd, mms_iface, dns64_servers):
     # not exist yet, so this can run before clatd creates the device.
     ensure_hoplimit_compat(MMS_CLAT_DEV, forward_subnet=None)
 
-    if systemd.is_active(unit):
-        src_addr = ipv6_global_addr(mms_iface)
-        if src_addr and configured_clat_v6_addr(mms_iface) == src_addr:
-            ensure_mms_outbound_route(mms_iface, src_addr)
-            return
-
-        # The bearer re-activated under a running instance and came back with a
-        # different address. clatd took its own clat-v6-addr at startup and has
-        # no way to learn the new one, so the translator and the return-path
-        # rule it installed both still name an address the interface no longer
-        # has: every MMS flow through the CLAT is silently dead, while the
-        # outbound rule above looks correct. Rebuild rather than return.
-        systemd.stop(unit)
-
     src_addr = wait_for_addr(mms_iface)
     if not src_addr:
         return
 
-    write_clatd_conf(
-        mms_iface,
+    changed = write_clatd_conf(mms_iface, clatd_conf(
         dns64_servers,
         v4_defaultroute_enable=False,
         clat_dev=MMS_CLAT_DEV,
         clat_v4_addr=MMS_CLAT_V4_ADDR,
         clat_v6_addr=src_addr,
         route_table=MMS_ROUTE_TABLE,
-    )
+    ))
     add_dns64_routes(mms_iface, src_addr, dns64_servers)
     ensure_mms_outbound_route(mms_iface, src_addr)
-    systemd.restart(unit)
+
+    if not changed and systemd.is_active(unit):
+        return
+
+    if systemd.is_active(unit):
+        # clatd reads clat-v6-addr once at startup and cannot learn a new one,
+        # so stop it first and let it remove the rules naming the old address.
+        systemd.stop(unit)
+    start_clatd(systemd, unit, MMS_CLAT_DEV, route_table=MMS_ROUTE_TABLE)
 
 def ensure_nat64_prefix_routes(iface, prefix=None):
     """
@@ -428,14 +653,16 @@ def default_route_iface(family="-6"):
     """
     The interface currently carrying the default route, or None.
     """
-    result = subprocess.run(
-        ["ip", family, "route", "show", "default"], capture_output=True, text=True
-    )
-    for line in result.stdout.split("\n"):
-        fields = line.split()
-        if "dev" in fields:
-            return fields[fields.index("dev") + 1]
+    for route in ip_json(family, "route", "show", "default"):
+        if route.get("dev"):
+            return route["dev"]
     return None
+
+def iface_family(iface):
+    """
+    An interface name with its trailing index removed: ccmni3 -> ccmni.
+    """
+    return iface.rstrip(string.digits)
 
 def bearer_iface_is_current(iface, attempts=5, delay=1):
     """
@@ -456,16 +683,25 @@ def bearer_iface_is_current(iface, attempts=5, delay=1):
     configuration, and refusing to act then would leave clatd down with
     nothing scheduled to bring it up.
     """
+    # Compared by name family rather than a hardcoded list, so ccmni, rmnet
+    # and wwan all work.
+    family = iface_family(iface)
     for i in range(attempts):
         routed = default_route_iface()
-        if routed is None or routed == iface:
+        # Only another cellular interface holding the default route means a
+        # rotation is under way. A non-cellular one means Wi-Fi is simply
+        # preferred, which is not a reason to leave the CLAT down.
+        rotating = (
+            routed is not None and routed != iface and routed.startswith(family)
+        )
+        if not rotating:
             return True
         if i + 1 < attempts:
             time.sleep(delay)
 
     return False
 
-def manage_cellular(iface, systemd, dns64_servers):
+def manage_cellular(iface, systemd, dns64_servers, plat_prefix=None):
     unit = f"clatd@{iface}.service"
 
     # The NAT64 prefix routes are needed whenever the bearer is configured, not
@@ -476,7 +712,7 @@ def manage_cellular(iface, systemd, dns64_servers):
     # rather than on the default route avoids pointing them at an interface that
     # is not actually configured yet.
     if ipv6_global_addr(iface):
-        ensure_nat64_prefix_routes(iface)
+        ensure_nat64_prefix_routes(iface, plat_prefix)
 
     if not bearer_iface_is_current(iface):
         # Mid-rotation: leave the existing setup alone rather than pinning it
@@ -484,57 +720,32 @@ def manage_cellular(iface, systemd, dns64_servers):
         # fires again once the move settles.
         return
 
-    write_clatd_conf(iface, dns64_servers)
-
     src_addr = wait_for_addr(iface)
+    if not src_addr:
+        log(f"{unit} not started: {iface} has no global address yet")
+        return
+
+    changed = write_clatd_conf(
+        iface, cellular_clatd_conf(dns64_servers, src_addr, plat_prefix)
+    )
     add_dns64_routes(iface, src_addr, dns64_servers)
-    ensure_nat64_prefix_routes(iface)
+    ensure_nat64_prefix_routes(iface, plat_prefix)
     ensure_hoplimit_compat()
-    systemd.restart(unit)
 
-    # Watch for up to 20s and correct clatd's self-selected address if
-    # needed. Keep watching for the full window because a closely-following
-    # invocation (e.g. a "down" then "up" pair from the same reconnect) can
-    # restart clatd again after we've already corrected it.
-    fixed_once = False
-    routed_prefix = None
-    for _ in range(20):
-        time.sleep(1)
-        if not systemd.is_active(unit):
-            return
+    # Routes and mangle rules above are refreshed either way, all idempotent.
+    if not changed and systemd.is_active(unit):
+        log(f"{unit} already current, not restarting")
+        return
+    if start_clatd(systemd, unit, DEFAULT_CLAT_DEV, plat_prefix, CLAT_ROUTE_TABLE) and not plat_prefix:
+        # clatd discovered the prefix itself, so it is in neither the cache
+        # nor the conf this instance was started from. Record it in both.
+        write_cached_plat_prefix(observed_plat_prefix())
+        learned = read_cached_plat_prefix()
+        if learned:
+            write_clatd_conf(
+                iface, cellular_clatd_conf(dns64_servers, src_addr, learned)
+            )
 
-        rule_output = subprocess.run(
-            ["ip", "-6", "rule", "show"], capture_output=True, text=True
-        ).stdout
-        match = next((line for line in rule_output.splitlines() if "fwmark 0xc1a7" in line), None)
-        if not match:
-            continue
-
-        m = IP6_RULE_RE.search(match)
-        if not m:
-            continue
-        prefix, picked_addr = m.group(1), m.group(2)
-
-        if prefix != routed_prefix:
-            ensure_nat64_prefix_routes(iface, prefix)
-            routed_prefix = prefix
-
-        real_addr = ipv6_global_addr(iface)
-        if not real_addr:
-            continue
-
-        if picked_addr == real_addr:
-            # Correct. Only stop watching if we've never had to fix it,
-            # otherwise keep watching in case a restart is still in flight.
-            if not fixed_once:
-                break
-            time.sleep(2)
-            continue
-
-        run_ip("-6", "route", "replace", prefix, "dev", iface, "src", real_addr)
-        systemd.restart(unit)
-        fixed_once = True
-        time.sleep(2)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -548,10 +759,16 @@ def parse_args():
 def main():
     args = parse_args()
 
+    syslog.openlog(LOG_TAG, syslog.LOG_PID, syslog.LOG_DAEMON)
+
+    # Must be installed before the bus connection is made, so signals dispatch.
+    DBusGMainLoop(set_as_default=True)
+
     lock_file = open(LOCK_PATH, "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        log("another instance holds the lock, skipping this invocation")
         return
 
     try:
@@ -565,11 +782,18 @@ def main():
         else:
             cellular_iface, cellular_dns64 = discover_context(bus, "internet", attempts=8, delay=1)
 
+        plat_prefix = read_cached_plat_prefix()
+        log(
+            f"bearers: internet={cellular_iface or '-'} mms={mms_iface or '-'} "
+            f"plat-prefix={plat_prefix or 'discover'}"
+        )
+
         if not args.mms_only:
             wanted = {iface for iface in (cellular_iface, mms_iface) if iface}
             for unit in systemd.clatd_units():
                 m = CLATD_UNIT_RE.match(unit)
                 if m and m.group(1) not in wanted:
+                    log(f"stopping stale {unit}")
                     systemd.stop(unit)
 
         if mms_iface:
@@ -579,9 +803,9 @@ def main():
             return
 
         if cellular_iface:
-            manage_cellular(cellular_iface, systemd, cellular_dns64)
+            manage_cellular(cellular_iface, systemd, cellular_dns64, plat_prefix)
     except dbus.exceptions.DBusException as error:
-        print(f"clatd-bearer-manager: D-Bus error: {error}", file=sys.stderr)
+        log(f"D-Bus error: {error}")
 
 if __name__ == "__main__":
     main()
